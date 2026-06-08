@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     time::Instant,
 };
-
+//
 fn main() {
     let start = Instant::now();
     let path: &str = "data/measurements.txt";
