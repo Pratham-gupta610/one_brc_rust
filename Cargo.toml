@@ -10,4 +10,5 @@ lto = true
 codegen-units = 1
 panic = "abort"
 [dependencies]
+libc = "0.2.186"
 memmap2 = "0.9"

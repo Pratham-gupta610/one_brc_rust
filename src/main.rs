@@ -1,11 +1,12 @@
+use memmap2::Mmap;
+use std::ffi::c_void;
+use std::os::raw::c_int;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
     io::Write,
     time::Instant,
 };
-
-use memmap2::Mmap;
 
 //
 fn main() {
@@ -18,13 +19,36 @@ fn main() {
     let map: Mmap = mmap(&f);
 
     let mut stats = HashMap::<Vec<u8>, (i32, i64, usize, i32)>::new();
+
+    let mut at = 0;
+
     let mut rows = 0usize;
 
-    for line in map.split(|c| *c == b'\n') {
-        //  let line = line.unwrap();
+    // for line in map.split(|c| *c == b'\n')
+    loop {
+        let rest = &map[at..];
+        // SAFETY: rest is valid for at least rest.len() bytes
+        let next_newline =
+            unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
+
+        let line = if next_newline.is_null() {
+            //NOTE:  don't need to remember to break, since next iteration will find empty line
+            rest
+        } else {
+            // SAFETY: memchr always returns pointers in rest, which are valid
+            let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
+            &rest[..len]
+        };
+
+        at += line.len() + 1;
+
         if line.is_empty() {
-            continue;
+            break;
         }
+
+        // if line.is_empty() {
+        //     continue;
+        // }
         rows += 1;
 
         let mut fields = line.rsplitn(2, |c| *c == b';');
@@ -35,33 +59,8 @@ fn main() {
         };
 
         // SAFETY: the README promised
-        // let mut t: i32 = 0;
-        // let mut mul: i32 = 1;
 
-        let mut t: i32 = 0;
-        let mut mul: i32 = 1;
-
-        for &d in temperature.iter().rev() {
-            match d {
-                b'.' => {}
-                b'-' => {
-                    t = -t;
-                    break;
-                }
-                b'0'..=b'9' => {
-                    t += i32::from(d - b'0') * mul;
-                    mul *= 10;
-                }
-                _ => panic!("bad temperature"),
-            }
-        }
-        // let temperature = fields.next().unwrap();
-        // let station = fields.next().unwrap();
-
-        // let temperature: f64 = unsafe { std::str::from_utf8_unchecked(temperature) }
-        //     .parse()
-        //     .unwrap();
-
+        let t = parse_temperature(temperature);
         let stats = match stats.get_mut(station) {
             Some(stats) => stats,
             None => stats
@@ -120,11 +119,31 @@ fn main() {
     eprintln!("File size: {:.2} GB", gb);
     eprintln!("Rows processed: {}", rows);
     eprintln!("Stations found: {}", station_count);
-    eprintln!("----Execution time----: {:.3?}", elapsed);
+    eprintln!("\x1b[31mExecution time: {:.3?}\x1b[0m", elapsed);
     eprintln!("Rows/sec: {:.2} million", rows_per_sec / 1_000_000.0);
     eprintln!("Throughput: {:.2} GB/sec", gb_per_sec);
     eprintln!("===============================");
 }
 fn mmap(f: &File) -> Mmap {
     unsafe { Mmap::map(f).unwrap() }
+}
+fn parse_temperature(temperature: &[u8]) -> i32 {
+    let mut t: i32 = 0;
+    let mut mul: i32 = 1;
+
+    for &d in temperature.iter().rev() {
+        match d {
+            b'.' => {}
+            b'-' => {
+                t = -t;
+                break;
+            }
+            b'0'..=b'9' => {
+                t += i32::from(d - b'0') * mul;
+                mul *= 10;
+            }
+            _ => panic!("bad temperature"),
+        }
+    }
+    t
 }
