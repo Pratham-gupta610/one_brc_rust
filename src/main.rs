@@ -46,9 +46,6 @@ fn main() {
             break;
         }
 
-        // if line.is_empty() {
-        //     continue;
-        // }
         rows += 1;
 
         let mut fields = line.rsplitn(2, |c| *c == b';');
