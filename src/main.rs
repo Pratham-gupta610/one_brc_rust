@@ -1,14 +1,48 @@
+#![feature(portable_simd)]
+#![feature(slice_split_once)]
+
 use memmap2::Mmap;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
+    hash::{BuildHasher, Hasher},
+
     io::Write,
+    os::fd::AsRawFd,
+    //NOTE: The above   os::fd::AsRawFd, works only on unix environment for windows it will throw error
+    // simd::{cmp::SimdPartialEq, u8x64},
     time::Instant,
 };
 
-//
+struct FastHasherBuilder;
+struct FastHasher(u64);
+
+impl BuildHasher for FastHasherBuilder {
+    type Hasher = FastHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FastHasher(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        let mut last = [1u8; 8];
+        (last[..remainder.len()]).copy_from_slice(remainder);
+        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
+            let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
+            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        }
+    }
+}
 fn main() {
     let start = Instant::now();
     let path: &str = "data/measurements.txt";
@@ -17,8 +51,12 @@ fn main() {
     let f: File = File::open(path).unwrap();
     // let f: BufReader<File> = BufReader::new(f);
     let map: Mmap = mmap(&f);
+    // NOTE: maybe make the key &[u8], but measure since we're breaking MADV_SEQUENTIAL
 
-    let mut stats = HashMap::<Vec<u8>, (i32, i64, usize, i32)>::new();
+    let mut stats = HashMap::<Vec<u8>, (i16, i64, usize, i16), _>::with_capacity_and_hasher(
+        100_000,
+        FastHasherBuilder,
+    );
 
     let mut at = 0;
 
@@ -26,34 +64,14 @@ fn main() {
 
     // for line in map.split(|c| *c == b'\n')
     loop {
-        let rest = &map[at..];
-        // SAFETY: rest is valid for at least rest.len() bytes
-        let next_newline =
-            unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
-
-        let line = if next_newline.is_null() {
-            //NOTE:  don't need to remember to break, since next iteration will find empty line
-            rest
-        } else {
-            // SAFETY: memchr always returns pointers in rest, which are valid
-            let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
-            &rest[..len]
-        };
-
-        at += line.len() + 1;
-
+        let line = next_line(&map, &mut at);
         if line.is_empty() {
             break;
         }
 
         rows += 1;
 
-        let mut fields = line.rsplitn(2, |c| *c == b';');
-        let (Some(temperature), Some(station)) = (fields.next(), fields.next()) else {
-            panic!("bad line: {}", unsafe {
-                std::str::from_utf8_unchecked(line)
-            });
-        };
+        let (station, temperature) = split_semi(line);
 
         // SAFETY: the README promised
 
@@ -62,7 +80,7 @@ fn main() {
             Some(stats) => stats,
             None => stats
                 .entry(station.to_vec())
-                .or_insert((i32::MAX, 0, 0, i32::MIN)),
+                .or_insert((i16::MAX, 0, 0, i16::MIN)),
         };
         stats.0 = stats.0.min(t);
         stats.1 += t as i64;
@@ -121,26 +139,91 @@ fn main() {
     eprintln!("Throughput: {:.2} GB/sec", gb_per_sec);
     eprintln!("===============================");
 }
+//fn next_line<'a>(map: &'a [u8], at: &mut usize) -> &'a [u8] {
+//     let rest = &map[*at..];
+//     // SAFETY: rest is valid for at least rest.len() bytes
+//     let next_newline =
+//         unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
+//     let line = if next_newline.is_null() {
+//         // don't need to remember to break, since next iteration will find empty line
+//         rest
+//     } else {
+//         // SAFETY: memchr always returns pointers in rest, which are valid
+//         let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
+//         &rest[..len]
+//     };
+//     *at += line.len() + 1;
+//     line
+// }
+
+fn next_line<'a>(map: &'a [u8], at: &mut usize) -> &'a [u8] {
+    if *at >= map.len() {
+        return &[];
+    }
+
+    let rest = &map[*at..];
+
+    let next_newline =
+        unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
+
+    if next_newline.is_null() {
+        *at = map.len();
+        rest
+    } else {
+        let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
+        *at += len + 1;
+        &rest[..len]
+    }
+}
 fn mmap(f: &File) -> Mmap {
     unsafe { Mmap::map(f).unwrap() }
 }
-fn parse_temperature(temperature: &[u8]) -> i32 {
-    let mut t: i32 = 0;
-    let mut mul: i32 = 1;
+fn split_semi(line: &[u8]) -> (&[u8], &[u8]) {
+    // line.rsplit_once(|c| *c == b';').unwrap()
+    unsafe { line.rsplit_once(|&c| c == b';').unwrap_unchecked() }
+    // we know, line is at most 100+1+5 = 106b
+}
+fn parse_temperature(temp: &[u8]) -> i16 {
+    // let mut t: i32 = 0;
+    // let mut mul: i32 = 1;
 
-    for &d in temperature.iter().rev() {
-        match d {
-            b'.' => {}
-            b'-' => {
-                t = -t;
-                break;
-            }
-            b'0'..=b'9' => {
-                t += i32::from(d - b'0') * mul;
-                mul *= 10;
-            }
-            _ => panic!("bad temperature"),
+    // for &d in temperature.iter().rev() {
+    //     match d {
+    //         b'.' => {}
+    //         b'-' => {
+    //             t = -t;
+    //             break;
+    //         }
+    //         b'0'..=b'9' => {
+    //             t += i32::from(d - b'0') * mul;
+    //             mul *= 10;
+    //         }
+    //         _ => panic!("bad temperature"),
+    //     }
+    // }
+    // t
+    match temp.len() {
+        3 => {
+            // 1.2
+            ((temp[0] - b'0') as i16) * 10 + (temp[2] - b'0') as i16
         }
+        4 => {
+            if temp[0] == b'-' {
+                // -1.2
+                -(((temp[1] - b'0') as i16) * 10 + (temp[3] - b'0') as i16)
+            } else {
+                // 12.3
+                ((temp[0] - b'0') as i16) * 100
+                    + ((temp[1] - b'0') as i16) * 10
+                    + (temp[3] - b'0') as i16
+            }
+        }
+        5 => {
+            // -12.3
+            -(((temp[1] - b'0') as i16) * 100
+                + ((temp[2] - b'0') as i16) * 10
+                + (temp[4] - b'0') as i16)
+        }
+        _ => unsafe { std::hint::unreachable_unchecked() },
     }
-    t
 }
