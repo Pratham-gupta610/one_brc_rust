@@ -1,5 +1,5 @@
-#![feature(portable_simd)]
-#![feature(slice_split_once)]
+// #![feature(portable_simd)]
+// #![feature(slice_split_once)]
 
 use memmap2::Mmap;
 use std::ffi::c_void;
@@ -15,34 +15,138 @@ use std::{
     // simd::{cmp::SimdPartialEq, u8x64},
     time::Instant,
 };
+pub struct FastHasherBuilder;
 
-struct FastHasherBuilder;
-struct FastHasher(u64);
+pub struct FastHasher {
+    len: u64,
+    hash: u64,
+}
 
 impl BuildHasher for FastHasherBuilder {
     type Hasher = FastHasher;
 
+    #[inline(always)]
     fn build_hasher(&self) -> Self::Hasher {
-        FastHasher(0xcbf29ce484222325)
+        FastHasher { len: 0, hash: 0 }
     }
 }
 
 impl Hasher for FastHasher {
     #[inline(always)]
     fn finish(&self) -> u64 {
-        self.0
+        self.hash
     }
+
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.len = i as u64;
+    }
+
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        let (chunks, remainder) = bytes.as_chunks::<8>();
-        let mut last = [1u8; 8];
-        (last[..remainder.len()]).copy_from_slice(remainder);
-        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
-            let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
-            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        unsafe {
+            let l = bytes.len();
+            let len = if self.len != 0 { self.len } else { l as u64 };
+            let ptr = bytes.as_ptr();
+
+            let (first, last, mid) = if l >= 16 {
+                (
+                    (ptr as *const u64).read_unaligned(),
+                    (ptr.add(l - 8) as *const u64).read_unaligned(),
+                    (ptr.add(l / 2 - 4) as *const u64).read_unaligned(),
+                )
+            } else if l >= 8 {
+                let first = (ptr as *const u64).read_unaligned();
+                let last = (ptr.add(l - 8) as *const u64).read_unaligned();
+                (first, last, first)
+            } else {
+                let small = read_small(ptr, l);
+                (small, small, small)
+            };
+
+            let mut h = first;
+            h ^= last.rotate_left(23);
+            h ^= mid.rotate_left(41);
+            h ^= len.wrapping_mul(0x9E37_79B1_85EB_CA87);
+
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+            h ^= h >> 33;
+
+            self.hash = h | (h == 0) as u64;
         }
     }
 }
+
+#[inline(always)]
+unsafe fn read_small(ptr: *const u8, len: usize) -> u64 {
+    match len {
+        0 => 0,
+        1 => *ptr as u64,
+        2 => (*ptr as u64) | ((*ptr.add(1) as u64) << 8),
+        3 => (*ptr as u64) | ((*ptr.add(1) as u64) << 8) | ((*ptr.add(2) as u64) << 16),
+        4 => {
+            (*ptr as u64)
+                | ((*ptr.add(1) as u64) << 8)
+                | ((*ptr.add(2) as u64) << 16)
+                | ((*ptr.add(3) as u64) << 24)
+        }
+        5 => {
+            (*ptr as u64)
+                | ((*ptr.add(1) as u64) << 8)
+                | ((*ptr.add(2) as u64) << 16)
+                | ((*ptr.add(3) as u64) << 24)
+                | ((*ptr.add(4) as u64) << 32)
+        }
+        6 => {
+            (*ptr as u64)
+                | ((*ptr.add(1) as u64) << 8)
+                | ((*ptr.add(2) as u64) << 16)
+                | ((*ptr.add(3) as u64) << 24)
+                | ((*ptr.add(4) as u64) << 32)
+                | ((*ptr.add(5) as u64) << 40)
+        }
+        7 => {
+            (*ptr as u64)
+                | ((*ptr.add(1) as u64) << 8)
+                | ((*ptr.add(2) as u64) << 16)
+                | ((*ptr.add(3) as u64) << 24)
+                | ((*ptr.add(4) as u64) << 32)
+                | ((*ptr.add(5) as u64) << 40)
+                | ((*ptr.add(6) as u64) << 48)
+        }
+        _ => std::hint::unreachable_unchecked(),
+    }
+}
+// struct FastHasherBuilder;
+// struct FastHasher(u64);
+
+// impl BuildHasher for FastHasherBuilder {
+//     type Hasher = FastHasher;
+
+//     fn build_hasher(&self) -> Self::Hasher {
+//         FastHasher(0xcbf29ce484222325)
+//     }
+// }
+
+// impl Hasher for FastHasher {
+//     #[inline(always)]
+//     fn finish(&self) -> u64 {
+//         self.0
+//     }
+//     #[inline(always)]
+//     fn write(&mut self, bytes: &[u8]) {
+//         let (chunks, remainder) = bytes.as_chunks::<8>();
+//         let mut last = [1u8; 8];
+//         (last[..remainder.len()]).copy_from_slice(remainder);
+//         for &chunk in chunks.iter().chain(std::iter::once(&last)) {
+//             let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
+//             self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+//         }
+//     }
+// }
 fn main() {
     let start = Instant::now();
     let path: &str = "data/measurements.txt";
@@ -54,7 +158,7 @@ fn main() {
     // NOTE: maybe make the key &[u8], but measure since we're breaking MADV_SEQUENTIAL
 
     let mut stats = HashMap::<Vec<u8>, (i16, i64, usize, i16), _>::with_capacity_and_hasher(
-        100_000,
+        600,
         FastHasherBuilder,
     );
 
@@ -180,8 +284,20 @@ fn mmap(f: &File) -> Mmap {
 }
 fn split_semi(line: &[u8]) -> (&[u8], &[u8]) {
     // line.rsplit_once(|c| *c == b';').unwrap()
-    unsafe { line.rsplit_once(|&c| c == b';').unwrap_unchecked() }
+    // unsafe { line.rsplit_once(|&c| c == b';').unwrap_unchecked() }
     // we know, line is at most 100+1+5 = 106b
+    let mut i = line.len() - 6;
+
+    unsafe {
+        while i < line.len() {
+            if *line.get_unchecked(i) == b';' {
+                return (line.get_unchecked(..i), line.get_unchecked(i + 1..));
+            }
+            i += 1;
+        }
+
+        std::hint::unreachable_unchecked()
+    }
 }
 fn parse_temperature(temp: &[u8]) -> i16 {
     // let mut t: i32 = 0;
